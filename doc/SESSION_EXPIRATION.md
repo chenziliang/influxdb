@@ -3,13 +3,13 @@
 When session expiration, it means the Data Node has lost connection with ETCD for some time(exceeds session TTL). The local metadata may not up-to-date with ETCD.
 
 ## Master Node
-> - Stop the control logic.
-> - Try to connect to the ETCD just as the data node join cluster for the first time.
-> - During the connection loss period, the master node should reject all requests directly(requests from client and other data nodes). 
+- Stop the control logic.
+- Try to connect to the ETCD just as the data node join cluster for the first time.
+- During the connection loss period, the master node should reject all requests directly(requests from client and other data nodes). 
 
 ## Non Master Node
-> - Try to connect to the ETCD just as the data node join cluster for the first time.
-> - During the connection loss period, the data node should reject all requests directly(requests from client and other data nodes). 
+- Try to connect to the ETCD just as the data node join cluster for the first time.
+- During the connection loss period, the data node should reject all requests directly(requests from client and other data nodes). 
 
 ## Connection Loss Period
 ### option1
