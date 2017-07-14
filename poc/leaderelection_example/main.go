@@ -12,7 +12,7 @@ type Controller struct {
 	Identitiy string
 }
 
-func (c *Controller) onControllerFailover(stop <-chan struct{}) {
+func (c *Controller) onControllerFailover() {
 	fmt.Printf("onControllerFailover=%s\n", c.Identitiy)
 	time.Sleep(1000 * time.Second)
 }
@@ -33,7 +33,7 @@ func (c *Controller) startup() {
 		glog.Fatal(err)
 	}
 
-	leaderelection.RunOrDie(leaderelection.LeaderElectionConfig{
+	leaderelection.Startup(leaderelection.LeaderElectionConfig{
 		Client: cli,
 		Election: "controller",
 		Identity: c.Identitiy,
@@ -52,7 +52,15 @@ func main() {
 	c2 := Controller{
 		Identitiy: "server2",
 	}
+	c3 := Controller{
+		Identitiy: "server3",
+	}
+	c4 := Controller{
+		Identitiy: "server4",
+	}
 	go c1.startup()
 	go c2.startup()
+	go c3.startup()
+	go c4.startup()
 	time.Sleep(1000 * time.Second)
 }
