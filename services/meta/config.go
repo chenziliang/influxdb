@@ -17,7 +17,9 @@ const (
 
 // Config represents the meta configuration.
 type Config struct {
-	Dir string `toml:"dir"`
+	EtcdEndpoints string `toml:"etdc-endpoints"`
+	// in Seconds
+	LeaseDuration int64 `toml:"lease-duration"`
 
 	RetentionAutoCreate bool `toml:"retention-autocreate"`
 	LoggingEnabled      bool `toml:"logging-enabled"`
@@ -26,6 +28,7 @@ type Config struct {
 // NewConfig builds a new configuration with default values.
 func NewConfig() *Config {
 	return &Config{
+		LeaseDuration:       2,
 		RetentionAutoCreate: true,
 		LoggingEnabled:      DefaultLoggingEnabled,
 	}
@@ -33,8 +36,12 @@ func NewConfig() *Config {
 
 // Validate returns an error if the config is invalid.
 func (c *Config) Validate() error {
-	if c.Dir == "" {
-		return errors.New("Meta.Dir must be specified")
+	if c.EtcdEndpoints == "" {
+		return errors.New("Meta.EtcdEndpoints must be specified")
+	}
+
+	if c.LeaseDuration <= 0 {
+		return errors.New("Meta.LeaseDuration must be a positive number")
 	}
 	return nil
 }
@@ -42,6 +49,6 @@ func (c *Config) Validate() error {
 // Diagnostics returns a diagnostics representation of a subset of the Config.
 func (c *Config) Diagnostics() (*diagnostics.Diagnostics, error) {
 	return diagnostics.RowFromMap(map[string]interface{}{
-		"dir": c.Dir,
+		"etcd-endpoints": c.EtcdEndpoints,
 	}), nil
 }

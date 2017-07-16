@@ -9,11 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -29,8 +25,6 @@ const (
 	// SaltBytes is the number of bytes used for salts.
 	SaltBytes = 32
 
-	metaFile = "meta.db"
-
 	// ShardGroupDeletedExpiration is the amount of time before a shard group info will be removed from cached
 	// data after it has been marked deleted (2 weeks).
 	ShardGroupDeletedExpiration = -2 * 7 * 24 * time.Hour
@@ -43,6 +37,35 @@ var (
 	// ErrService is returned when the meta service returns an error.
 	ErrService = errors.New("meta service error")
 )
+
+type StorageService interface {
+	Load() (*Data, error)
+	Snapshot(data *Data) error
+
+	// Node
+	AddNode(node *NodeInfo) error
+	UpdateNode(node *NodeInfo) error
+	GetNode(nodeID string) (*NodeInfo, error)
+	DeleteNode(nodeID string) error
+
+	// Database
+	AddDatabase(db *DatabaseInfo) error
+	UpdateDatabase(db *DatabaseInfo) error
+	GetDatabase(dbName string) (*DatabaseInfo, error)
+	DeleteDatabase(dbName string) error
+
+	// Retention policy
+	AddRetentionPolicy(dbName string, rp *RetentionPolicyInfo) error
+	UpdateRetentionPolicy(dbName string, rp *RetentionPolicyInfo) error
+	GetRetentionPolicy(dbName, rpName string) (*RetentionPolicyInfo, error)
+	DeleteRetentionPolicy(dbName, rpName string) error
+
+	// User
+	AddUser(user *UserInfo) error
+	UpdateUser(user *UserInfo) error
+	GetUser(userName string) (*UserInfo, error)
+	DeleteUser(userName string) error
+}
 
 // Client is used to execute commands on and read data from
 // a meta service cluster.
@@ -57,7 +80,8 @@ type Client struct {
 	// Authentication cache.
 	authCache map[string]authUser
 
-	path string
+	// metadata storage
+	storage StorageService
 
 	retentionAutoCreate bool
 }
@@ -69,19 +93,20 @@ type authUser struct {
 }
 
 // NewClient returns a new *Client.
-func NewClient(config *Config) *Client {
+func NewClient(config *Config) (*Client, error) {
+	storage, err := NewEtcdStorageService(config)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
-		cacheData: &Data{
-			ClusterID: uint64(rand.Int63()),
-			Index:     1,
-		},
 		closing:             make(chan struct{}),
 		changed:             make(chan struct{}),
 		logger:              zap.New(zap.NullEncoder()),
 		authCache:           make(map[string]authUser, 0),
-		path:                config.Dir,
+		storage:             storage,
 		retentionAutoCreate: config.RetentionAutoCreate,
-	}
+	}, nil
 }
 
 // Open a connection to a meta service cluster.
@@ -89,14 +114,14 @@ func (c *Client) Open() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Try to load from disk
+	// Try to load from storage service
 	if err := c.Load(); err != nil {
 		return err
 	}
 
 	// If this is a brand new instance, persist to disk immediatly.
-	if c.cacheData.Index == 1 {
-		if err := snapshot(c.path, c.cacheData); err != nil {
+	if c.cacheData.Index != 1 {
+		if err := c.storage.Snapshot(c.cacheData); err != nil {
 			return err
 		}
 	}
@@ -172,27 +197,30 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	data := c.cacheData.Clone()
-
-	if db := data.Database(name); db != nil {
+	if db := c.cacheData.Database(name); db != nil {
 		return db, nil
 	}
 
-	if err := data.CreateDatabase(name); err != nil {
+	if err := c.cacheData.CreateDatabase(name); err != nil {
 		return nil, err
 	}
 
 	// create default retention policy
+	rpi := DefaultRetentionPolicyInfo()
 	if c.retentionAutoCreate {
-		rpi := DefaultRetentionPolicyInfo()
-		if err := data.CreateRetentionPolicy(name, rpi, true); err != nil {
+		if err := c.cacheData.CreateRetentionPolicy(name, rpi, true); err != nil {
 			return nil, err
 		}
 	}
 
-	db := data.Database(name)
+	db := c.cacheData.Database(name)
+	if err := c.storage.AddDatabase(db); err != nil {
+		// FIXME rollback
+		return nil, err
+	}
 
-	if err := c.commit(data); err != nil {
+	if err := c.storage.AddRetentionPolicy(name, rpi); err != nil {
+		// FIXME rollback
 		return nil, err
 	}
 
@@ -212,6 +240,7 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 // database.
 //
 func (c *Client) CreateDatabaseWithRetentionPolicy(name string, spec *RetentionPolicySpec) (*DatabaseInfo, error) {
+	// FIXME, call create databse and then create retention policy
 	if spec == nil {
 		return nil, errors.New("CreateDatabaseWithRetentionPolicy called with nil spec")
 	}
@@ -219,26 +248,32 @@ func (c *Client) CreateDatabaseWithRetentionPolicy(name string, spec *RetentionP
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	data := c.cacheData.Clone()
-
 	if spec.Duration != nil && *spec.Duration < MinRetentionPolicyDuration && *spec.Duration != 0 {
 		return nil, ErrRetentionPolicyDurationTooLow
 	}
 
-	db := data.Database(name)
+	db := c.cacheData.Database(name)
 	if db == nil {
-		if err := data.CreateDatabase(name); err != nil {
+		if err := c.cacheData.CreateDatabase(name); err != nil {
 			return nil, err
 		}
-		db = data.Database(name)
+
+		db = c.cacheData.Database(name)
+		if err := c.storage.AddDatabase(db); err != nil {
+			// roll back
+			return nil, err
+		}
 	}
 
 	// No existing retention policies, so we can create the provided policy as
 	// the new default policy.
 	rpi := spec.NewRetentionPolicyInfo()
 	if len(db.RetentionPolicies) == 0 {
-		if err := data.CreateRetentionPolicy(name, rpi, true); err != nil {
+		if err := c.cacheData.CreateRetentionPolicy(name, rpi, true); err != nil {
 			return nil, err
+		}
+		if err := c.storage.AddRetentionPolicy(name, rpi); err != nil {
+			return nil, err;
 		}
 	} else if !spec.Matches(db.RetentionPolicy(rpi.Name)) {
 		// In this case we already have a retention policy on the database and
@@ -255,13 +290,8 @@ func (c *Client) CreateDatabaseWithRetentionPolicy(name string, spec *RetentionP
 		return nil, ErrRetentionPolicyConflict
 	}
 
-	// Commit the changes.
-	if err := c.commit(data); err != nil {
-		return nil, err
-	}
-
 	// Refresh the database info.
-	db = data.Database(name)
+	db = c.cacheData.Database(name)
 
 	return db, nil
 }
@@ -289,19 +319,25 @@ func (c *Client) CreateRetentionPolicy(database string, spec *RetentionPolicySpe
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	data := c.cacheData.Clone()
-
 	if spec.Duration != nil && *spec.Duration < MinRetentionPolicyDuration && *spec.Duration != 0 {
 		return nil, ErrRetentionPolicyDurationTooLow
 	}
 
+	// FIXME revisit cache Data design
 	rp := spec.NewRetentionPolicyInfo()
-	if err := data.CreateRetentionPolicy(database, rp, makeDefault); err != nil {
+	if err := c.cacheData.CreateRetentionPolicy(database, rp, makeDefault); err != nil {
 		return nil, err
 	}
 
-	if err := c.commit(data); err != nil {
+	if err := c.storage.AddRetentionPolicy(database, rp); err != nil {
 		return nil, err
+	}
+
+	if makeDefault {
+		// FIXME, roll back default
+		if err := c.storage.UpdateDatabase(c.cacheData.Database(database)); err != nil {
+			return nil, err
+		}
 	}
 
 	return rp, nil
@@ -410,12 +446,10 @@ func (c *Client) CreateUser(name, password string, admin bool) (User, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	data := c.cacheData.Clone()
-
 	// See if the user already exists.
-	if u := data.user(name); u != nil {
+	if u := c.cacheData.user(name); u != nil {
 		if err := bcrypt.CompareHashAndPassword([]byte(u.Hash), []byte(password)); err != nil || u.Admin != admin {
-			return nil, ErrUserExists
+			return nil, ErrUserNotFound
 		}
 		return u, nil
 	}
@@ -426,13 +460,15 @@ func (c *Client) CreateUser(name, password string, admin bool) (User, error) {
 		return nil, err
 	}
 
-	if err := data.CreateUser(name, string(hash), admin); err != nil {
+	// Commit in-memory cache first
+	if err := c.cacheData.CreateUser(name, string(hash), admin); err != nil {
 		return nil, err
 	}
 
-	u := data.user(name)
-
-	if err := c.commit(data); err != nil {
+	u := c.cacheData.user(name)
+	if err := c.storage.AddUser(u); err != nil {
+		// Since we first commit in memory cache, we will need remove it
+		c.cacheData.DropUser(name)
 		return nil, err
 	}
 
@@ -444,23 +480,30 @@ func (c *Client) UpdateUser(name, password string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	data := c.cacheData.Clone()
-
 	// Hash the password before serializing it.
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		return err
 	}
 
-	if err := data.UpdateUser(name, string(hash)); err != nil {
+	u := c.cacheData.user(name)
+	if u != nil {
+		return ErrUserNotFound
+	}
+
+	// Work on a copy first
+	updated := *u
+	updated.Hash = string(hash)
+
+	if err := c.storage.UpdateUser(&updated); err != nil {
+		return err
+	}
+
+	if err := c.cacheData.UpdateUser(name, string(hash)); err != nil {
 		return err
 	}
 
 	delete(c.authCache, name)
-
-	if err := c.commit(data); err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -470,13 +513,11 @@ func (c *Client) DropUser(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	data := c.cacheData.Clone()
-
-	if err := data.DropUser(name); err != nil {
+	if err := c.storage.DeleteUser(name); err != nil {
 		return err
 	}
 
-	if err := c.commit(data); err != nil {
+	if err := c.cacheData.DropUser(name); err != nil {
 		return err
 	}
 
@@ -957,7 +998,7 @@ func (c *Client) commit(data *Data) error {
 	data.Index++
 
 	// try to write to disk before updating in memory
-	if err := snapshot(c.path, data); err != nil {
+	if err := c.storage.Snapshot(data); err != nil {
 		return err
 	}
 
@@ -985,61 +1026,14 @@ func (c *Client) WithLogger(log zap.Logger) {
 	c.logger = log.With(zap.String("service", "metaclient"))
 }
 
-// snapshot saves the current meta data to disk.
-func snapshot(path string, data *Data) error {
-	file := filepath.Join(path, metaFile)
-	tmpFile := file + "tmp"
-
-	f, err := os.Create(tmpFile)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	var d []byte
-	if b, err := data.MarshalBinary(); err != nil {
-		return err
-	} else {
-		d = b
-	}
-
-	if _, err := f.Write(d); err != nil {
-		return err
-	}
-
-	if err = f.Sync(); err != nil {
-		return err
-	}
-
-	//close file handle before renaming to support Windows
-	if err = f.Close(); err != nil {
-		return err
-	}
-
-	return renameFile(tmpFile, file)
-}
-
 // Load loads the current meta data from disk.
 func (c *Client) Load() error {
-	file := filepath.Join(c.path, metaFile)
-
-	f, err := os.Open(file)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-
-	data, err := ioutil.ReadAll(f)
+	data, err := c.storage.Load()
 	if err != nil {
 		return err
 	}
 
-	if err := c.cacheData.UnmarshalBinary(data); err != nil {
-		return err
-	}
+	c.cacheData = data
 	return nil
 }
 
